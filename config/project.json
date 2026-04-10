@@ -1,0 +1,85 @@
+{
+    "data_dirs": {
+        "lt_submit4.3": {
+            "path": "/ssd1/liangtai-work/lt_submit4.3",
+            "output_dir": "/ssd1/liangtai-work/lt_submit4.3_dim_gen",
+            "total_subgraphs": 3777,
+            "status": {
+                "needs_constraints": 1947,
+                "hardcoded": 1809,
+                "broken": 21,
+                "ready_for_generalization": 0,
+                "needs_reifier": 0
+            },
+            "symint_distribution": {
+                "0_symint": 1830,
+                "1_symint": 1323,
+                "2_symint": 408,
+                "3+_symint": 216
+            },
+            "constraint_status": {
+                "empty": 3749,
+                "missing": 27,
+                "invalid": 1
+            },
+            "reifier_assigned": 19,
+            "top_shapes": ["[1,S]", "[S,S,3,3]", "[1,S,768]", "[1,S,1024]", "[1,S,4096]", "[S,S]"]
+        },
+        "lt_submit4.7": {
+            "path": "/ssd1/liangtai-work/lt_submit4.7",
+            "output_dir": "/ssd1/liangtai-work/lt_submit4.7_dim_gen",
+            "total_subgraphs": 484,
+            "status": {
+                "needs_constraints": 415,
+                "hardcoded": 67,
+                "broken": 2,
+                "ready_for_generalization": 0,
+                "needs_reifier": 0
+            },
+            "symint_distribution": {
+                "0_symint": 69,
+                "1_symint": 295,
+                "2_symint": 69,
+                "3+_symint": 51
+            },
+            "constraint_status": {
+                "empty": 481,
+                "missing": 3
+            },
+            "reifier_assigned": 0,
+            "top_shapes": ["[1,S]", "[1,S,4096]", "[1,S,768]", "[1,S,1024]", "[1,S,6144]", "[S,S]"]
+        },
+        "lt_submit4.9": {
+            "path": "/ssd1/liangtai-work/lt_submit4.9",
+            "output_dir": "/ssd1/liangtai-work/lt_submit4.9_dim_gen",
+            "total_subgraphs": 2064,
+            "status": {
+                "needs_constraints": 1304,
+                "hardcoded": 755,
+                "broken": 5,
+                "ready_for_generalization": 0,
+                "needs_reifier": 0
+            },
+            "symint_distribution": {
+                "0_symint": 760,
+                "1_symint": 900,
+                "2_symint": 251,
+                "3+_symint": 153
+            },
+            "constraint_status": {
+                "empty": 2056,
+                "missing": 8
+            },
+            "reifier_assigned": 3,
+            "top_shapes": ["[1,S]", "[1,S,768]", "[1,S,1024]", "[1,S,4096]", "[S,S]", "[S]"]
+        }
+    },
+    "total_subgraphs": 6325,
+    "generalization": {
+        "num_variants": 9,
+        "dim_variants": [
+            [1, 64], [1, 512], [16, 128], [32, 64], [8, 256],
+            [4, 512], [2, 1024], [64, 128], [128, 64]
+        ]
+    }
+}
