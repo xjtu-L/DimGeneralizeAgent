@@ -140,6 +140,13 @@ source /ssd1/liangtai-work/DimGeneralizeAgent/scripts/setup_env.sh
 $PYTHON $DIM_GEN_ROOT/scripts/ops.py verify <output_dir>/0/<model_name>/<subgraph>
 ```
 
+### Step 5: 汇报统计
+
+完成所有步骤后，汇报：
+- 各状态处理成功/跳过/失败数量
+- 硬编码子图数量
+- 损坏子图数量
+
 ## 自定义 Reifier: subgraph_sym_dim_reifier
 
 由于子图级别的输入形状模式（如 `[(1,S0,4096)]`、`[(S0,S1)]`）与 GraphNet 内置的 NLP/CV Reifier 不匹配，已安装自定义 Reifier 作为兜底。
@@ -210,9 +217,12 @@ source /ssd1/liangtai-work/DimGeneralizeAgent/scripts/setup_env.sh
    b. 重新诊断保存到新 JSON，needs_reifier → batch assign-reifier --status-filter needs_reifier --diag-json <新JSON>
    c. 重新诊断保存到新 JSON，ready_for_generalization → batch generalize --status-filter ready_for_generalization --output-dir /ssd1/liangtai-work/lt_submit4.7_dim_gen --diag-json <新JSON>
 
-4. 硬编码子图（hardcoded）单独分析，看能不能 symbolize
+4. 随机抽样 verify 验证泛化结果能否运行：
+   python3.10 /ssd1/liangtai-work/DimGeneralizeAgent/scripts/ops.py verify /ssd1/liangtai-work/lt_submit4.7_dim_gen/0/<随机选一个子图>
 
-5. 汇报最终统计
+5. 硬编码子图（hardcoded）单独分析，看能不能 symbolize
+
+6. 汇报最终统计
 
 注意：每步完成后重新诊断，确保状态正确流转。遇到大量错误要停下来分析原因。
 ```
@@ -234,7 +244,8 @@ source /ssd1/liangtai-work/DimGeneralizeAgent/scripts/setup_env.sh
 2. batch gen-constraints --status-filter needs_constraints --diag-json /tmp/diag_47.json
 3. 重新诊断 → batch assign-reifier --status-filter needs_reifier --diag-json <新JSON>
 4. 重新诊断 → batch generalize --status-filter ready_for_generalization --output-dir <对应output_dir> --diag-json <新JSON>
-5. 分析 hardcoded 子图
+5. 随机抽样 verify 验证
+6. 分析 hardcoded 子图
 
 每个目录完成后汇报统计，再进入下一个。
 ```
