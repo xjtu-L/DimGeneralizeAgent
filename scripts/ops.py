@@ -178,21 +178,24 @@ def op_diagnose(sg_path):
 
 
 def op_gen_constraints(sg_path):
-    """为含 SymInt 的子图生成 input_tensor_constraints.py"""
-    symint_params, tensor_params = parse_forward_signature(sg_path)
-    if not symint_params:
-        print(f"SKIP: No SymInt params in {sg_path}")
-        return False
+    """生成 input_tensor_constraints.py（符号化）
 
+    符号化：分析 tensor shapes，找公共维度，用 sympy Symbol 标记。
+    与 SymInt 无关，适用于有 SymInt 和无 SymInt 的子图。
+    """
+    symint_params, tensor_params = parse_forward_signature(sg_path)
     tensors = parse_weight_meta(os.path.join(sg_path, "weight_meta.py"))
     tensor_dict = {t["name"]: t for t in tensors}
 
-    # 构建第一个输入 tensor 的 input_shapes
+    # 收集所有输入 tensor 的 input_shapes
     input_shapes = []
+    dynamic_input_names = []  # 非权重的输入 Tensor
     for t in tensors:
         if t["name"] in tensor_params and len(t["shape"]) > 0:
             input_shapes.append((list(t["shape"]), t["name"]))
-            break  # 只取第一个
+            is_weight = "_parameters_" in t["name"]
+            if not is_weight:
+                dynamic_input_names.append(t["name"])
 
     if not input_shapes:
         print(f"SKIP: No input tensors with shape in {sg_path}")
@@ -200,13 +203,72 @@ def op_gen_constraints(sg_path):
 
     dyn_dim_cstrs = DynamicDimConstraints.make_by_named_inputs(input_shapes)
 
-    # 符号化: axis 1 (seq_len), axis 0 (batch)
-    dyn_dim_cstrs.symbolize(filter_fn=lambda name, idx, axis, dim: axis == 1 and dim > 1)
-    dyn_dim_cstrs.symbolize(filter_fn=lambda name, idx, axis, dim: axis == 0 and dim > 1)
+    # 确定哪些维度是动态的
+    # 策略：分析动态输入 tensor 的 shapes，找出公共维度（高频维度）
+    dynamic_set = set(dynamic_input_names)
 
-    # 兜底: 如果还没符号化，尝试任意 >1 的维度
-    if len(dyn_dim_cstrs.symbols) == 0:
-        dyn_dim_cstrs.symbolize(filter_fn=lambda name, idx, axis, dim: dim > 1)
+    # 如果有 SymInt，用 SymInt example_value 识别动态维度
+    symint_values = set()
+    if symint_params:
+        for t in tensors:
+            if t["name"] in symint_params and t.get("data") is not None:
+                for v in (t["data"] if isinstance(t["data"], list) else [t["data"]]):
+                    if isinstance(v, int) and v > 1:
+                        symint_values.add(v)
+
+    # 分析动态输入的维度频率
+    from collections import defaultdict, Counter
+    dim_freq = Counter()  # 维度值 -> 出现次数
+    dim_positions = defaultdict(list)  # 维度值 -> [(idx, axis, name)]
+
+    for idx, (shape, name) in enumerate(dyn_dim_cstrs.input_shapes):
+        if name not in dynamic_set:
+            continue
+        for axis, dim in enumerate(shape):
+            if isinstance(dim, int) and dim > 1:
+                dim_freq[dim] += 1
+                dim_positions[dim].append((idx, axis, name))
+
+    # 确定 candidate 维度值
+    # 如果有 SymInt，优先使用 SymInt example_value
+    # 否则，使用高频维度（出现次数 >= 2）
+    candidate_dims = set()
+    if symint_values:
+        candidate_dims = symint_values
+    else:
+        # 找出高频维度
+        for dim, count in dim_freq.items():
+            if count >= 2:
+                candidate_dims.add(dim)
+        # 如果没有高频维度，取出现次数最多的维度
+        if not candidate_dims and dim_freq:
+            top_dim = dim_freq.most_common(1)[0][0]
+            candidate_dims.add(top_dim)
+
+    if not candidate_dims:
+        print(f"SKIP: No dynamic dimensions found in {sg_path}")
+        return False
+
+    # 符号化：按 axis 优先级处理
+    # axis 1 (seq_len) 优先，然后 axis 0 (batch)，然后其他
+    def axis_priority(item):
+        axis = item[0][0]
+        if axis == 1: return 0
+        if axis == 0: return 1
+        return 2
+
+    from collections import defaultdict
+    dim_groups = defaultdict(list)  # (axis, dim_value) -> [(input_idx, axis, name)]
+    for dim_val in candidate_dims:
+        for idx, axis, name in dim_positions.get(dim_val, []):
+            dim_groups[(axis, dim_val)].append((idx, axis, name))
+
+    for (axis, dim_val), positions in sorted(dim_groups.items(), key=axis_priority):
+        target_positions = set((idx, ax) for idx, ax, name in positions)
+        sym = dyn_dim_cstrs.symbolize(
+            filter_fn=lambda name, idx, axis, dim, _pos=target_positions, _dim=dim_val:
+                (idx, axis) in _pos and dim == _dim
+        )
 
     if len(dyn_dim_cstrs.symbols) == 0:
         print(f"SKIP: No dimensions could be symbolized in {sg_path}")
@@ -217,19 +279,60 @@ def op_gen_constraints(sg_path):
     with open(cstr_path, "w") as f:
         f.write(cstr_code)
 
+    # 如果有 SymInt，更新 weight_meta.py 里的 SymInt example_value
+    if symint_params:
+        wm_path = os.path.join(sg_path, "weight_meta.py")
+        if os.path.exists(wm_path):
+            with open(wm_path) as f:
+                wm_content = f.read()
+
+            for sym in dyn_dim_cstrs.symbols:
+                sym_name = str(sym).lower()  # S0 -> s0
+                example_val = dyn_dim_cstrs.symbol2example_value.get(sym, 4)
+                pattern = rf'(class\s+\w+:\s*\n(?:\s+\w+\s*=\s*.*\n)*?\s+name\s*=\s*"{sym_name}"\s*\n(?:\s+\w+\s*=\s*.*\n)*?)\s+data\s*=\s*\[.*?\]'
+                replacement = rf'\1\n\tdata = [{example_val}]'
+                wm_content = re.sub(pattern, replacement, wm_content)
+
+            with open(wm_path, "w") as f:
+                f.write(wm_content)
+
     print(f"OK: Generated constraints for {sg_path}")
+    print(f"  Has SymInt: {bool(symint_params)}")
     print(f"  Symbols: {[s.name for s in dyn_dim_cstrs.symbols]}")
     print(f"  Symbolic shapes: {dyn_dim_cstrs.serialize_symbolic_input_shapes_to_str()}")
+    print(f"  Example values: {dyn_dim_cstrs.symbol2example_value}")
     return True
 
 
 def op_symbolize(sg_path):
-    """对硬编码维度的子图执行 FX Pass 符号化（使用 GraphNet 的 DimensionSymbolizer）"""
+    """SymInt 参数化：基于约束文件，给 model.py 添加 SymInt 参数
+
+    仅用于 hardcoded 子图（没有 SymInt 参数的子图）。
+    需要先运行 gen-constraints 生成约束文件。
+
+    注意：此操作使用 GraphNet 的 DimensionSymbolizer，它会：
+    1. 读取 input_tensor_constraints.py
+    2. 分析哪些维度应该变为 SymInt
+    3. 重写 model.py，将硬编码维度替换为 SymInt 参数
+    """
     from graph_net.torch.sample_pass.dimension_symbolizer import DimensionSymbolizer
 
     symint_params, _ = parse_forward_signature(sg_path)
     if symint_params:
         print(f"SKIP: Already has SymInt in {sg_path}")
+        return False
+
+    # 检查约束文件是否存在
+    cstr_path = os.path.join(sg_path, "input_tensor_constraints.py")
+    if not os.path.exists(cstr_path):
+        print(f"SKIP: No constraints file in {sg_path} (run gen-constraints first)")
+        return False
+
+    # 检查约束文件是否有效
+    with open(cstr_path) as f:
+        content = f.read()
+    if not ("Symbol" in content and "dynamic_dim_constraint_symbols" in content):
+        print(f"SKIP: Invalid constraints file in {sg_path}")
         return False
 
     try:
@@ -239,7 +342,7 @@ def op_symbolize(sg_path):
         })
         rel_path = os.path.basename(os.path.dirname(sg_path)) + "/" + os.path.basename(sg_path)
         symbolizer(rel_path)
-        print(f"OK: Symbolized {sg_path}")
+        print(f"OK: Symbolized (added SymInt) for {sg_path}")
         return True
     except Exception as e:
         print(f"ERROR: Symbolization failed for {sg_path}: {e}")
@@ -328,42 +431,200 @@ def op_reify_preview(sg_path):
             print(f"    [{i}] {v}")
 
 
-def op_generalize(sg_path, output_dir, data_dir, dim_indices=None, resume=True):
-    """为子图生成 9 份维度泛化副本"""
+def op_llm_reify(sg_path, values_str=None):
+    """LLM 具体化：提取符号信息供 Agent 推理，或写入 Agent 推理的维度值
+
+    用法:
+        # 1. 提取符号信息（输出给 Agent 推理）
+        python3.10 ops.py llm-reify <sg_path>
+
+        # 2. 写入 Agent 推理的维度值
+        python3.10 ops.py llm-reify <sg_path> --values "S0=64,128,256 S1=1,1,1"
+    """
+    cstr_path = os.path.join(sg_path, "input_tensor_constraints.py")
+
+    if not os.path.exists(cstr_path):
+        print(f"ERROR: No constraints file in {sg_path}")
+        print("Run gen-constraints first.")
+        return False
+
+    try:
+        cstr = DynamicDimConstraints.unserialize_from_py_file(cstr_path)
+    except Exception as e:
+        print(f"ERROR: Failed to parse constraints: {e}")
+        return False
+
+    if len(cstr.symbols) == 0:
+        print(f"ERROR: No symbols found in {sg_path}")
+        return False
+
+    # 提取符号信息
+    symbols = [str(s) for s in cstr.symbols]
+    example_values = {str(k): v for k, v in cstr.symbol2example_value.items()}
+    symbolic_shapes = cstr.serialize_symbolic_input_shapes_to_str()
+
+    # 分析输入 tensor 信息
+    input_shapes = []
+    for shape, name in cstr.input_shapes:
+        shape_str = [str(d) for d in shape]
+        input_shapes.append({"name": name, "shape": shape_str})
+
+    if values_str is None:
+        # 输出符号信息供 Agent 推理
+        print("\n" + "=" * 60)
+        print("符号化信息（供 Agent 推理具体维度值）")
+        print("=" * 60)
+
+        print(f"\n## 子图路径: {sg_path}")
+        print(f"\n## 符号: {', '.join(symbols)}")
+        print(f"\n## 当前示例值: {example_values}")
+        print(f"\n## 符号化形状: {symbolic_shapes}")
+        print(f"\n## 输入 Tensor:")
+        for inp in input_shapes[:5]:
+            print(f"  - {inp['name']}: {inp['shape']}")
+        if len(input_shapes) > 5:
+            print(f"  - ... 还有 {len(input_shapes) - 5} 个")
+
+        print("\n" + "-" * 60)
+        print("请 Agent 根据上述信息，推理出每个符号的推荐维度值。")
+        print("返回格式: S0=64,128,256 S1=1,1,1")
+        print("（每个符号提供多组值，组数应相同，如都是 9 组）")
+        print("-" * 60)
+
+        # 输出 JSON 格式
+        result = {
+            "path": sg_path,
+            "symbols": symbols,
+            "example_values": example_values,
+            "symbolic_shapes": symbolic_shapes,
+            "input_shapes": input_shapes,
+        }
+        print("\n## JSON 格式:")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        return True
+
+    else:
+        # 解析并写入 Agent 推理的值
+        values = {}
+        for part in re.split(r'[;\s]+', values_str.strip()):
+            if '=' in part:
+                sym, vals = part.split('=', 1)
+            elif ':' in part:
+                sym, vals = part.split(':', 1)
+            else:
+                continue
+            sym = sym.strip()
+            vals = [int(v.strip()) for v in vals.split(',') if v.strip().isdigit()]
+            if vals:
+                values[sym] = vals
+
+        if not values:
+            print(f"ERROR: Failed to parse values from: {values_str}")
+            print("Expected format: 'S0=64,128,256 S1=1,1,1'")
+            return False
+
+        # 验证符号
+        for sym in values:
+            if sym not in symbols:
+                print(f"WARNING: Unknown symbol: {sym}")
+
+        # 检查各组长度是否一致
+        lengths = [len(v) for v in values.values()]
+        if len(set(lengths)) > 1:
+            print(f"ERROR: Inconsistent value counts: {dict((k, len(v)) for k, v in values.items())}")
+            print("All symbols must have the same number of values")
+            return False
+
+        num_variants = lengths[0] if lengths else 0
+        print(f"\n将写入 {num_variants} 组维度值:")
+        for sym, vals in values.items():
+            print(f"  {sym}: {vals}")
+
+        # 写入 llm_reified_values.json
+        output = {
+            "symbols": list(values.keys()),
+            "values": values,
+            "num_variants": num_variants,
+        }
+
+        output_path = os.path.join(sg_path, "llm_reified_values.json")
+        with open(output_path, "w") as f:
+            json.dump(output, f, indent=2)
+
+        print(f"\nOK: Written to {output_path}")
+        print(f"Next: run generalize with --use-llm flag")
+        return True
+
+
+def op_generalize(sg_path, output_dir, data_dir, dim_indices=None, resume=True, use_llm=False):
+    """为子图生成维度泛化副本
+
+    支持两种方式：
+    1. Reifier 方式：使用预设的 Reifier（默认）
+    2. LLM 方式：使用 Agent 推理的维度值（--use-llm）
+    """
     from graph_net.torch.sym_dim_reifiers.reifier_mgr import get_reifier
     from graph_net.tensor_meta import TensorMeta
     from graph_net.hash_util import get_sha256_hash
-
-    if dim_indices is None:
-        dim_indices = list(range(9))
-
-    # 检查 reifier
-    json_path = os.path.join(sg_path, "graph_net.json")
-    with open(json_path) as f:
-        gn = json.load(f)
-    reifier_name = gn.get("symbolic_dimension_reifier")
-    if not reifier_name:
-        print(f"SKIP: No reifier in {sg_path}")
-        return False
 
     # 获取约束
     cstr_path = os.path.join(sg_path, "input_tensor_constraints.py")
     dyn_dim_cstrs = DynamicDimConstraints.unserialize_from_py_file(cstr_path)
 
-    # 获取 reified dims
-    reifier_class = get_reifier(reifier_name)
-    reifier_instance = reifier_class(sg_path)
-    assert reifier_instance.match()
-    symbols2reified_dims = reifier_instance.reify()
-    assert len(symbols2reified_dims) == 1
-    key, reified_dims = next(iter(symbols2reified_dims.items()))
+    symbols = [str(s) for s in dyn_dim_cstrs.symbols]
+    reified_dims = []
 
-    # Normalize key
-    if isinstance(key, tuple):
-        symbols = list(key)
+    if use_llm:
+        # 使用 LLM 具体化的维度值
+        llm_path = os.path.join(sg_path, "llm_reified_values.json")
+        if not os.path.exists(llm_path):
+            print(f"ERROR: No LLM values file in {sg_path}")
+            print("Run llm-reify with --values first.")
+            return False
+
+        with open(llm_path) as f:
+            llm_data = json.load(f)
+
+        llm_symbols = llm_data["symbols"]
+        llm_values = llm_data["values"]
+        num_variants = llm_data["num_variants"]
+
+        # 生成 reified_dims 格式
+        for i in range(num_variants):
+            dims = [llm_values[s][i] for s in llm_symbols]
+            reified_dims.append(dims)
+
+        print(f"Using LLM-reified values: {num_variants} variants")
+        if dim_indices is None:
+            dim_indices = list(range(num_variants))
+
     else:
-        symbols = [key]
-        reified_dims = [[v] for v in reified_dims]
+        # 使用 Reifier 方式
+        if dim_indices is None:
+            dim_indices = list(range(9))
+
+        json_path = os.path.join(sg_path, "graph_net.json")
+        with open(json_path) as f:
+            gn = json.load(f)
+        reifier_name = gn.get("symbolic_dimension_reifier")
+        if not reifier_name:
+            print(f"SKIP: No reifier in {sg_path}")
+            return False
+
+        reifier_class = get_reifier(reifier_name)
+        reifier_instance = reifier_class(sg_path)
+        assert reifier_instance.match()
+        symbols2reified_dims = reifier_instance.reify()
+        assert len(symbols2reified_dims) == 1
+        key, reified_dims = next(iter(symbols2reified_dims.items()))
+
+        # Normalize key
+        if isinstance(key, tuple):
+            symbols = list(key)
+        else:
+            symbols = [key]
+            reified_dims = [[v] for v in reified_dims]
 
     # 获取 rel_path
     rel_path = os.path.relpath(sg_path, data_dir)
@@ -400,17 +661,49 @@ def op_generalize(sg_path, output_dir, data_dir, dim_indices=None, resume=True):
             cur_dyn_dim_cstrs.serialize_to_py_str()
         )
 
-        # Update SymInt example values in weight_meta.py
+        # Write updated tensor metas back to weight_meta.py and input_meta.py
+        # (key fix: previously only SymInt data was updated via regex,
+        #  but Tensor shapes were updated in memory and never written back)
+        input_meta_names = set()
+        for meta_file in ["input_meta.py"]:
+            meta_path = os.path.join(sg_path, meta_file)
+            if os.path.exists(meta_path):
+                for tm in TensorMeta.unserialize_from_py_file(meta_path):
+                    input_meta_names.add(tm.name)
+
+        input_metas = [tm for tm in cur_tensor_metas if tm.name in input_meta_names]
+        weight_metas = [tm for tm in cur_tensor_metas if tm.name not in input_meta_names]
+
+        if input_metas:
+            TensorMeta.save_tensor_metas(os.path.join(out_path, "input_meta.py"), input_metas)
+        if weight_metas:
+            TensorMeta.save_tensor_metas(os.path.join(out_path, "weight_meta.py"), weight_metas)
+
+        # Update SymInt data values in weight_meta.py
         wm_path = os.path.join(out_path, "weight_meta.py")
         if os.path.exists(wm_path):
             with open(wm_path) as f:
                 wm_content = f.read()
             for sym, value in symbol2example_value.items():
-                s_name = str(sym).lower()
-                pattern = rf'(class\s+\w+:\s*\n(?:\s+\w+\s*=\s*.*\n)*?\s+name\s*=\s*"{s_name}"\s*\n(?:\s+\w+\s*=\s*.*\n)*?)\s+data\s*=\s*\[.*?\]'
+                sym_name = str(sym).lower()  # S0 -> s0
+                pattern = rf'(class\s+\w+:\s*\n(?:\s+\w+\s*=\s*.*\n)*?\s+name\s*=\s*"{sym_name}"\s*\n(?:\s+\w+\s*=\s*.*\n)*?)\s+data\s*=\s*\[.*?\]'
                 replacement = rf'\1\n\tdata = [{value}]'
                 wm_content = re.sub(pattern, replacement, wm_content)
-            Path(wm_path).write_text(wm_content)
+            with open(wm_path, "w") as f:
+                f.write(wm_content)
+
+        # Fix missing imports in model.py (e.g. math_floor used but not imported)
+        model_py_path = os.path.join(out_path, "model.py")
+        if os.path.exists(model_py_path):
+            model_code = Path(model_py_path).read_text()
+            patches = []
+            if "math_floor" in model_code and "from math import floor as math_floor" not in model_code and "import math" not in model_code:
+                patches.append("from math import floor as math_floor")
+            if patches:
+                # Insert after existing imports
+                import_line = "\n".join(patches) + "\n"
+                model_code = model_code.replace("import torch\n", "import torch\n" + import_line, 1)
+                Path(model_py_path).write_text(model_code)
 
         # Update graph_hash
         model_code = Path(os.path.join(out_path, "model.py")).read_text()
@@ -423,30 +716,26 @@ def op_generalize(sg_path, output_dir, data_dir, dim_indices=None, resume=True):
 
 
 def op_verify(sg_path):
-    """验证子图是否可运行（尝试加载并执行 forward）"""
+    """验证子图是否可运行（使用 GraphNet 的 run_model 执行 forward）"""
+    import subprocess
     try:
-        from graph_net.imp_util import load_module
-        model_path = os.path.join(sg_path, "model.py")
-        py_module = load_module(model_path)
-        GraphModule = getattr(py_module, "GraphModule")
-        model = GraphModule()
-
-        # Try to create inputs from weight_meta
-        tensors = parse_weight_meta(os.path.join(sg_path, "weight_meta.py"))
-        import torch
-        inputs = []
-        for t in tensors:
-            if t["name"].startswith("L_") or t["name"].startswith("s"):
-                if t["shape"] and t["dtype"]:
-                    dtype = getattr(torch, t["dtype"].replace("torch.", ""))
-                    if t["data"] is not None:
-                        inputs.append(torch.tensor(t["data"], dtype=dtype).reshape(t["shape"]))
-                    else:
-                        inputs.append(torch.randn(t["shape"], dtype=dtype))
-
-        # Try forward (just check shape propagation, not full execution)
-        print(f"OK: {sg_path} is loadable")
-        return True
+        result = subprocess.run(
+            ["python3.10", "-m", "graph_net.torch.run_model", "--model-path", sg_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd="/ssd1/liangtai-work/GraphNet"
+        )
+        if result.returncode == 0:
+            print(f"OK: {sg_path} runs successfully")
+            return True
+        else:
+            print(f"ERROR: {sg_path} failed:")
+            print(result.stderr[-500:] if len(result.stderr) > 500 else result.stderr)
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: {sg_path} timed out (60s)")
+        return False
     except Exception as e:
         print(f"ERROR: {sg_path} failed: {e}")
         return False
@@ -471,7 +760,12 @@ def op_batch(data_dir, action, status_filter=None, model_name=None, output_dir=N
             logger.info(f"Loading diagnosis from {diag_json}...")
             with open(diag_json) as f:
                 cached = json.load(f)
-            cached_map = {item["path"]: item["status"] for item in cached.get("subgraphs", [])}
+            # 支持两种格式：列表 [...] 或字典 {"subgraphs": [...]}
+            if isinstance(cached, list):
+                items = cached
+            else:
+                items = cached.get("subgraphs", [])
+            cached_map = {item["path"]: item["status"] for item in items}
             filtered = [s for s in subgraphs if cached_map.get(s) == status_filter]
             logger.info(f"After filter (cached): {len(filtered)} subgraphs")
             subgraphs = filtered
@@ -530,6 +824,8 @@ def op_snapshot():
         ("lt_submit4.7", "/ssd1/liangtai-work/lt_submit4.7", "/ssd1/liangtai-work/lt_submit4.7_dim_gen"),
         ("lt_submit4.9", "/ssd1/liangtai-work/lt_submit4.9", "/ssd1/liangtai-work/lt_submit4.9_dim_gen"),
         ("lt_submit4.3", "/ssd1/liangtai-work/lt_submit4.3", "/ssd1/liangtai-work/lt_submit4.3_dim_gen"),
+        ("lt_submit4.10", "/ssd1/liangtai-work/lt_submit4.10", "/ssd1/liangtai-work/lt_submit4.10_dim_gen"),
+        ("lt_submit4.13", "/ssd1/liangtai-work/lt_submit4.13", "/ssd1/liangtai-work/lt_submit4.13_dim_gen"),
     ]
 
     results = []
@@ -537,7 +833,7 @@ def op_snapshot():
         logger.info(f"Scanning {name}...")
         subgraphs = find_all_subgraphs(data_dir)
         total = len(subgraphs)
-        counts = {"hardcoded": 0, "needs_constraints": 0, "needs_reifier": 0,
+        counts = {"hardcoded": 0, "needs_symbolize": 0, "needs_constraints": 0, "needs_reifier": 0,
                   "ready_for_generalization": 0, "broken": 0}
         for sg in subgraphs:
             diag = diagnose_subgraph(sg)
@@ -558,6 +854,7 @@ def op_snapshot():
             "name": name,
             "total": total,
             "hardcoded": counts["hardcoded"],
+            "needs_symbolize": counts["needs_symbolize"],
             "needs_constraints": counts["needs_constraints"],
             "needs_reifier": counts["needs_reifier"],
             "ready": counts["ready_for_generalization"],
@@ -566,11 +863,21 @@ def op_snapshot():
         })
 
     # Determine current task
+    # 处理顺序: gen-constraints → symbolize → assign-reifier → generalize
     all_done = True
     current_task = ""
     for r in results:
         if r["needs_constraints"] > 0:
             current_task = f"{r['name']}: gen-constraints (还有 {r['needs_constraints']} 个子图需要生成约束)"
+            all_done = False
+            break
+        if r["hardcoded"] > 0:
+            # hardcoded 需要先执行 gen-constraints
+            current_task = f"{r['name']}: gen-constraints (还有 {r['hardcoded']} 个硬编码子图需要生成约束)"
+            all_done = False
+            break
+        if r["needs_symbolize"] > 0:
+            current_task = f"{r['name']}: symbolize (还有 {r['needs_symbolize']} 个子图需要 SymInt 参数化)"
             all_done = False
             break
         if r["needs_reifier"] > 0:
@@ -581,10 +888,6 @@ def op_snapshot():
             current_task = f"{r['name']}: generalize (还有 {r['ready']} 个子图可以泛化)"
             all_done = False
             break
-        if r["hardcoded"] > 0:
-            current_task = f"{r['name']}: symbolize (还有 {r['hardcoded']} 个硬编码子图)"
-            all_done = False
-            break
     if all_done:
         current_task = "全部完成"
 
@@ -592,22 +895,18 @@ def op_snapshot():
     progress_path = os.path.join(os.path.dirname(scripts_dir), "PROGRESS.md")
 
     main_rows = []
-    total_all = total_nc = total_nr = total_gen = 0
+    total_all = total_hc = total_ns = total_nc = total_nr = total_gen = 0
     for r in results:
-        status = "完成" if (r["needs_constraints"] == 0 and r["needs_reifier"] == 0
-                          and r["ready"] == 0 and r["hardcoded"] == 0) else "进行中" if r["gen_done"] > 0 else "未开始"
-        main_rows.append(f"| {r['name']} | {r['total']} | {r['needs_constraints']} | {r['needs_reifier']} | {r['gen_done']} | {status} |")
+        status = "完成" if (r["hardcoded"] == 0 and r["needs_symbolize"] == 0 and r["needs_constraints"] == 0 and r["needs_reifier"] == 0
+                          and r["ready"] == 0) else "进行中" if r["gen_done"] > 0 else "未开始"
+        main_rows.append(f"| {r['name']} | {r['total']} | {r['hardcoded']} | {r['needs_symbolize']} | {r['needs_constraints']} | {r['needs_reifier']} | {r['gen_done']} | {status} |")
         total_all += r["total"]
+        total_hc += r["hardcoded"]
+        total_ns += r["needs_symbolize"]
         total_nc += r["needs_constraints"]
         total_nr += r["needs_reifier"]
         total_gen += r["gen_done"]
-    main_rows.append(f"| **合计** | **{total_all}** | **{total_nc}** | **{total_nr}** | **{total_gen}** | |")
-
-    hard_rows = []
-    for r in results:
-        sym_done = r["total"] - r["hardcoded"] - r["needs_constraints"] - r["needs_reifier"] - r["ready"] - r["broken"]
-        if sym_done < 0: sym_done = 0
-        hard_rows.append(f"| {r['name']} | {r['hardcoded']} | {sym_done} | 0 | 未开始 |")
+    main_rows.append(f"| **合计** | **{total_all}** | **{total_hc}** | **{total_ns}** | **{total_nc}** | **{total_nr}** | **{total_gen}** | |")
 
     broken_rows = [f"| {r['name']} | {r['broken']} |" for r in results]
 
@@ -621,17 +920,11 @@ def op_snapshot():
 
 ## 各目录进度
 
-处理顺序: 4.7 → 4.9 → 4.3（从小到大）
+处理顺序: 4.10 → 4.7 → 4.9 → 4.13 → 4.3（从小到大）
 
-| 目录 | 子图数 | 需gen-constraints | 需assign-reifier | 已generalize | 状态 |
-|------|--------|-------------------|------------------|-------------|------|
+| 目录 | 子图数 | 硬编码 | 需symbolize | 需gen-constraints | 需assign-reifier | 已generalize | 状态 |
+|------|--------|--------|-------------|-------------------|------------------|-------------|------|
 {chr(10).join(main_rows)}
-
-## 硬编码子图（需先 symbolize 再走后续流程）
-
-| 目录 | 硬编码数 | symbolize 成功 | symbolize 失败 | 状态 |
-|------|---------|---------------|---------------|------|
-{chr(10).join(hard_rows)}
 
 ## 损坏子图（跳过）
 
@@ -641,17 +934,18 @@ def op_snapshot():
 
 ## 处理规则
 
-1. 每个目录按顺序执行: gen-constraints → assign-reifier → generalize
-2. 硬编码子图先 symbolize，成功后进入 gen-constraints 流程
-3. 每步完成后运行 `python3.10 scripts/ops.py snapshot` 更新本文件
-4. 遇到大量错误停下来分析，不要继续刷
+1. 处理流程: gen-constraints (所有子图) → symbolize (仅硬编码子图) → assign-reifier → generalize
+2. 每步完成后运行 `python3.10 scripts/ops.py snapshot` 更新本文件
+3. 遇到大量错误停下来分析，不要继续刷
 
 ## 路径速查
 
 | | 数据 | 输出 |
 |--|------|------|
+| 4.10 | `/ssd1/liangtai-work/lt_submit4.10` | `/ssd1/liangtai-work/lt_submit4.10_dim_gen` |
 | 4.7 | `/ssd1/liangtai-work/lt_submit4.7` | `/ssd1/liangtai-work/lt_submit4.7_dim_gen` |
 | 4.9 | `/ssd1/liangtai-work/lt_submit4.9` | `/ssd1/liangtai-work/lt_submit4.9_dim_gen` |
+| 4.13 | `/ssd1/liangtai-work/lt_submit4.13` | `/ssd1/liangtai-work/lt_submit4.13_dim_gen` |
 | 4.3 | `/ssd1/liangtai-work/lt_submit4.3` | `/ssd1/liangtai-work/lt_submit4.3_dim_gen` |
 
 ## 备注
@@ -698,13 +992,20 @@ def main():
     p = subparsers.add_parser("reify-preview", help="Preview reifier's 9 dimension variants")
     p.add_argument("sg_path")
 
+    # llm-reify
+    p = subparsers.add_parser("llm-reify", help="LLM reification: extract symbols or apply Agent-reasoned values")
+    p.add_argument("sg_path")
+    p.add_argument("--values", "-v", type=str, default=None,
+                   help='Agent-reasoned values, format: "S0=64,128,256 S1=1,1,1"')
+
     # generalize
-    p = subparsers.add_parser("generalize", help="Generate 9 dimension variants")
+    p = subparsers.add_parser("generalize", help="Generate dimension variants")
     p.add_argument("sg_path")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--data-dir", required=True, help="Source data dir (for relative path calculation)")
     p.add_argument("--dim-indices", type=str, default=None, help="e.g. '0,1,2'")
     p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--use-llm", action="store_true", help="Use LLM-reified values instead of Reifier")
 
     # verify
     p = subparsers.add_parser("verify", help="Verify subgraph is runnable")
@@ -714,7 +1015,7 @@ def main():
     p = subparsers.add_parser("batch", help="Batch execute an operation")
     p.add_argument("data_dir")
     p.add_argument("--action", required=True, choices=["gen-constraints", "symbolize", "assign-reifier", "generalize", "verify"])
-    p.add_argument("--status-filter", choices=["hardcoded", "needs_constraints", "needs_reifier", "ready_for_generalization"])
+    p.add_argument("--status-filter", choices=["hardcoded", "needs_symbolize", "needs_constraints", "needs_reifier", "ready_for_generalization"])
     p.add_argument("--model-name", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--dim-indices", type=str, default=None)
@@ -736,9 +1037,12 @@ def main():
         op_assign_reifier(args.sg_path)
     elif args.command == "reify-preview":
         op_reify_preview(args.sg_path)
+    elif args.command == "llm-reify":
+        op_llm_reify(args.sg_path, args.values)
     elif args.command == "generalize":
-        dim_indices = [int(x) for x in args.dim_indices.split(",")] if args.dim_indices else list(range(9))
-        op_generalize(args.sg_path, args.output_dir, args.data_dir, dim_indices, resume=not args.no_resume)
+        dim_indices = [int(x) for x in args.dim_indices.split(",")] if args.dim_indices else None
+        op_generalize(args.sg_path, args.output_dir, args.data_dir, dim_indices,
+                      resume=not args.no_resume, use_llm=args.use_llm)
     elif args.command == "verify":
         op_verify(args.sg_path)
     elif args.command == "batch":

@@ -179,14 +179,27 @@ def diagnose_subgraph(sg_path):
             pass
 
     # 5. Determine status
+    # 新流程:
+    # 1. gen-constraints (所有子图) -> 生成约束文件
+    # 2. symbolize (仅 hardcoded) -> 添加 SymInt
+    # 3. assign-reifier -> generalize
+
     if not symint_params:
-        r["status"] = "hardcoded"
+        # 没有 SymInt 的子图
+        if r["constraint_status"] == "valid":
+            # 已有约束文件，可以执行 symbolize
+            r["status"] = "needs_symbolize"
+        else:
+            # 需要先执行 gen-constraints
+            r["status"] = "hardcoded"
     elif r["constraint_status"] == "valid":
+        # 有 SymInt 且有有效约束
         if r["reifier"]:
             r["status"] = "ready_for_generalization"
         else:
             r["status"] = "needs_reifier"
     else:
+        # 有 SymInt 但没有有效约束
         r["status"] = "needs_constraints"
 
     return r
@@ -198,7 +211,7 @@ def main():
     parser.add_argument("--model-name", type=str, default=None)
     parser.add_argument("--output", type=str, default=None, help="Save full results to JSON")
     parser.add_argument("--status-filter", type=str, default=None,
-                        choices=["hardcoded", "needs_constraints", "needs_reifier", "ready_for_generalization", "broken"])
+                        choices=["hardcoded", "needs_symbolize", "needs_constraints", "needs_reifier", "ready_for_generalization", "broken"])
     args = parser.parse_args()
 
     subgraphs = find_all_subgraphs(args.data_dir)
@@ -235,7 +248,7 @@ def main():
     print(f"{'='*60}")
 
     print(f"\n[Status Distribution]")
-    for status in ["ready_for_generalization", "needs_reifier", "needs_constraints", "hardcoded", "broken"]:
+    for status in ["ready_for_generalization", "needs_reifier", "needs_constraints", "needs_symbolize", "hardcoded", "broken"]:
         count = status_counts.get(status, 0)
         pct = count / max(len(results), 1) * 100
         print(f"  {status}: {count} ({pct:.1f}%)")
